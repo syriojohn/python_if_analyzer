@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environment
+venv/
+env/
+.env/
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and databases
+*.log
+logs/
+*.db
+*.sqlite3
+
+# Output files and plots
+plots/
+output/
+*.png
+*.jpg
+*.jpeg
+
+# Config files with sensitive info
+config.json
+
+# Windows specific
+Thumbs.db
+desktop.ini
