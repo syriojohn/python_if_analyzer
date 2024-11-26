@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                             QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox,
                             QScrollArea, QFrame, QListWidget, QLineEdit,
-                            QTabWidget)
+                            QTabWidget, QCheckBox, QGroupBox)
 from PySide6.QtCore import Qt, QThread, Signal, QMutex
 from PySide6.QtGui import QPixmap
 import pandas as pd
@@ -46,13 +46,14 @@ class AnalysisWorker(QThread):
     progress = Signal(str)
     error = Signal(str)
 
-    def __init__(self, input_file, output_dir, target_feature, analysis_features, contamination):
+    def __init__(self, input_file, output_dir, target_feature, analysis_features, contamination, feature_options):
         super().__init__()
         self.input_file = input_file
         self.output_dir = output_dir
         self.target_feature = target_feature
         self.analysis_features = analysis_features
         self.contamination = contamination
+        self.feature_options = feature_options
         self.mutex = QMutex()
         self.abort = False
 
@@ -62,45 +63,43 @@ class AnalysisWorker(QThread):
         self.mutex.unlock()
 
     def run(self):
+        """Run the analysis in a separate thread"""
         try:
-            # Load and preprocess data
+            # Load data
             self.progress.emit("Loading data...")
             df = pd.read_csv(self.input_file)
-            numeric_cols = [self.target_feature] + self.analysis_features
+            
+            # Convert numeric columns
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
             for col in numeric_cols:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
             if self.abort:
                 return
             
+            # Remove target feature from analysis features if present
+            if self.target_feature in self.analysis_features:
+                self.analysis_features.remove(self.target_feature)
+            
             # Run analysis
             self.progress.emit("Running analysis...")
             analyzer = AdvancedAnomalyAnalyzer(contamination=self.contamination)
             result = analyzer.analyze(
-                data=df,
+                df=df,  # Changed from data=df to df=df
                 target_feature=self.target_feature,
                 analysis_features=self.analysis_features,
+                feature_options=self.feature_options,
                 output_dir=self.output_dir
             )
             
             if self.abort:
                 return
             
-            # Create analysis result object
-            analysis_result = AnalysisResult(
-                df=df,
-                predictions=result.predictions,
-                target_feature=self.target_feature,
-                analysis_features=self.analysis_features
-            )
-            
-            self.progress.emit("Analysis complete!")
-            self.finished.emit(analysis_result)
+            # Emit the result
+            self.finished.emit(result)
             
         except Exception as e:
-            error_msg = f"Error in analysis: {str(e)}\n{traceback.format_exc()}"
-            self.error.emit(error_msg)
-            logging.error(error_msg)
+            self.error.emit(f"Error in analysis: {str(e)}\n{traceback.format_exc()}")
 
 class PlotViewer(QWidget):
     def __init__(self, parent=None):
@@ -161,6 +160,31 @@ class PlotViewer(QWidget):
                 
                 # Add spacing between plots
                 self.plot_layout.addSpacing(20)
+
+class FeatureOptionsWidget(QWidget):
+    def __init__(self, feature_name, parent=None):
+        super().__init__(parent)
+        self.feature_name = feature_name
+        layout = QHBoxLayout(self)
+        
+        # Feature name label
+        self.label = QLabel(feature_name)
+        layout.addWidget(self.label)
+        
+        # Checkboxes for options
+        self.use_raw = QCheckBox("Use Raw")
+        self.use_raw.setChecked(True)  # Default to True
+        self.use_ratio = QCheckBox("Use Ratio")
+        self.use_ratio.setChecked(True)  # Default to True
+        
+        layout.addWidget(self.use_raw)
+        layout.addWidget(self.use_ratio)
+        
+    def get_options(self):
+        return {
+            'use_raw': self.use_raw.isChecked(),
+            'use_ratio': self.use_ratio.isChecked()
+        }
 
 class AnomalyDetectorGUI(QMainWindow):
     def __init__(self):
@@ -226,7 +250,7 @@ class AnomalyDetectorGUI(QMainWindow):
                 self.output_dir_path.setText(self.config['output_dir'])
                 self.output_dir = self.config['output_dir']
         
-        # Feature selection
+        # Feature selection area
         feature_layout = QHBoxLayout()
         
         # Target feature selection
@@ -239,14 +263,22 @@ class AnomalyDetectorGUI(QMainWindow):
         
         # Analysis features selection
         analysis_layout = QVBoxLayout()
-        self.analysis_label = QLabel("Analysis Features:")
-        self.analysis_list = QListWidget()
-        self.analysis_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        analysis_layout.addWidget(self.analysis_label)
-        analysis_layout.addWidget(self.analysis_list)
+        self.features_label = QLabel("Analysis Features:")
+        self.features_list = QListWidget()
+        self.features_list.setSelectionMode(
+            QListWidget.SelectionMode.MultiSelection
+        )
+        analysis_layout.addWidget(self.features_label)
+        analysis_layout.addWidget(self.features_list)
         feature_layout.addLayout(analysis_layout)
         
         layout.addLayout(feature_layout)
+        
+        # Feature options area
+        self.feature_options_group = QGroupBox("Feature Analysis Options")
+        self.feature_options_layout = QVBoxLayout(self.feature_options_group)
+        self.feature_options_widgets = {}  # Store widgets for each feature
+        layout.addWidget(self.feature_options_group)
         
         # Contamination factor
         contamination_layout = QHBoxLayout()
@@ -257,28 +289,24 @@ class AnomalyDetectorGUI(QMainWindow):
         self.contamination_spin.setValue(0.1)
         contamination_layout.addWidget(self.contamination_label)
         contamination_layout.addWidget(self.contamination_spin)
-        contamination_layout.addStretch()
         layout.addLayout(contamination_layout)
         
         # Run button
         self.run_button = QPushButton("Run Analysis")
+        self.run_button.setEnabled(False)
         layout.addWidget(self.run_button)
         
-        # Log window
-        self.log_edit = QTextEdit()
-        layout.addWidget(self.log_edit)
-        
-        # Set up logging
-        self.log_handler = QTextEditLogger(self.log_edit)
-        logging.getLogger().addHandler(self.log_handler)
-        logging.getLogger().setLevel(logging.INFO)
+        # Log viewer
+        self.log_text = QTextEdit()
+        layout.addWidget(self.log_text)
         
         # Connect signals
         self.input_file_button.clicked.connect(self.browse_input_file)
         self.output_dir_button.clicked.connect(self.browse_output_dir)
         self.run_button.clicked.connect(self.run_analysis)
+        self.features_list.itemSelectionChanged.connect(self.update_feature_options)
         self.target_combo.currentTextChanged.connect(self.check_run_button)
-        self.analysis_list.itemSelectionChanged.connect(self.check_run_button)
+        self.features_list.itemSelectionChanged.connect(self.check_run_button)
         
         # Initialize worker
         self.worker = None
@@ -438,20 +466,43 @@ class AnomalyDetectorGUI(QMainWindow):
                 self.target_combo.addItems(features)
                 
                 # Update analysis features list
-                self.analysis_list.clear()
-                self.analysis_list.addItems(features)
+                self.features_list.clear()
+                self.features_list.addItems(features)
                 
                 logging.info(f"Loaded {len(features)} features from input file")
                 self.check_run_button()
         except Exception as e:
             logging.error(f"Error loading features: {str(e)}")
 
+    def update_feature_options(self):
+        """Update feature options when selection changes"""
+        # Clear existing options
+        for i in reversed(range(self.feature_options_layout.count())):
+            self.feature_options_layout.itemAt(i).widget().setParent(None)
+        
+        # Add options for selected features
+        selected_items = self.features_list.selectedItems()
+        self.feature_options_widgets = {}
+        
+        for item in selected_items:
+            feature_name = item.text()
+            option_widget = FeatureOptionsWidget(feature_name)
+            self.feature_options_widgets[feature_name] = option_widget
+            self.feature_options_layout.addWidget(option_widget)
+            
+    def get_feature_options(self):
+        """Get the current feature options for all selected features"""
+        options = {}
+        for feature_name, widget in self.feature_options_widgets.items():
+            options[feature_name] = widget.get_options()
+        return options
+
     def check_run_button(self):
         """Enable run button only if all selections are valid"""
         input_valid = self.input_file and os.path.exists(self.input_file)
         output_valid = self.output_dir and os.path.exists(self.output_dir)
         target_valid = self.target_combo.currentText() != ""
-        analysis_valid = len(self.analysis_list.selectedItems()) > 0
+        analysis_valid = len(self.features_list.selectedItems()) > 0
         
         self.run_button.setEnabled(
             input_valid and output_valid and target_valid and analysis_valid
@@ -460,7 +511,7 @@ class AnomalyDetectorGUI(QMainWindow):
     def validate_feature_selection(self):
         """Validate feature selection and return error message if invalid"""
         target_feature = self.target_combo.currentText()
-        analysis_features = [item.text() for item in self.analysis_list.selectedItems()]
+        analysis_features = [item.text() for item in self.features_list.selectedItems()]
         
         if not target_feature:
             return "Please select a target feature"
@@ -468,12 +519,16 @@ class AnomalyDetectorGUI(QMainWindow):
         if not analysis_features:
             return "Please select at least one analysis feature"
             
+        # Remove target feature from analysis features if present
         if target_feature in analysis_features:
+            analysis_features.remove(target_feature)
+            self.features_list.clearSelection()
+            for i in range(self.features_list.count()):
+                item = self.features_list.item(i)
+                if item.text() != target_feature:
+                    item.setSelected(True)
             return "Target feature cannot be included in analysis features"
-            
-        if len(analysis_features) < 2:
-            return "Please select at least two analysis features"
-            
+        
         return None
 
     def run_analysis(self):
@@ -493,7 +548,7 @@ class AnomalyDetectorGUI(QMainWindow):
             return
             
         target_feature = self.target_combo.currentText()
-        analysis_features = [item.text() for item in self.analysis_list.selectedItems()]
+        analysis_features = [item.text() for item in self.features_list.selectedItems()]
         
         self.run_button.setEnabled(False)
         
@@ -503,7 +558,8 @@ class AnomalyDetectorGUI(QMainWindow):
                 self.output_dir,
                 target_feature,
                 analysis_features,
-                self.contamination_spin.value()
+                self.contamination_spin.value(),
+                self.get_feature_options()
             )
             
             self.worker.progress.connect(lambda msg: logging.info(msg))

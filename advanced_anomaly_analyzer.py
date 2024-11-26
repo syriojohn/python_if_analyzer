@@ -8,6 +8,7 @@ from datetime import datetime
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 from pathlib import Path
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,87 +32,120 @@ class AdvancedAnomalyAnalyzer:
         self.column_mappings = {}
         self.target_feature = None
         self.analysis_features = None
+        self.feature_options = {}  # Store feature analysis options
         
-    def _create_engineered_features(self, 
-                                  df: pd.DataFrame, 
-                                  target_col: str,
-                                  analysis_cols: List[str]) -> pd.DataFrame:
+    def analyze(self, 
+                df: pd.DataFrame,
+                target_feature: str,
+                analysis_features: List[str],
+                feature_options: Dict[str, Dict[str, bool]],
+                output_dir: Optional[str] = None) -> AnalysisResult:
         """
-        Create engineered features based on ratios with target feature
-        """
-        df = df.copy()
-        
-        # Create ratios between target and each analysis feature
-        for col in analysis_cols:
-            if col != target_col:
-                feature_name = f"{target_col}_to_{col}_ratio"
-                # Avoid division by zero by adding small constant
-                df[feature_name] = (df[target_col] / 
-                                  df[col].clip(lower=0.0001))
-                
-        return df
-    
-    def analyze(self,
-               data: pd.DataFrame,
-               target_feature: str,
-               analysis_features: List[str],
-               output_dir: Optional[str] = None) -> AnalysisResult:
-        """
-        Perform anomaly analysis focused on a specific feature
+        Analyze the dataset using Isolation Forest
         
         Args:
-            data: Input DataFrame
-            target_feature: Main feature to analyze anomalies for
-            analysis_features: Other features to include in analysis
+            df: Input DataFrame
+            target_feature: Target feature to analyze
+            analysis_features: List of features to use in analysis
+            feature_options: Dict of feature options {feature_name: {'use_raw': bool, 'use_ratio': bool}}
             output_dir: Directory to save results and plots
-            
-        Returns:
-            AnalysisResult: Object containing analysis results
         """
-        # Validate features exist in dataset
-        all_features = [target_feature] + analysis_features
-        missing_features = [f for f in all_features if f not in data.columns]
-        if missing_features:
-            raise ValueError(f"Features not found in dataset: {missing_features}")
-            
         self.target_feature = target_feature
         self.analysis_features = analysis_features
+        self.feature_options = feature_options
         
-        # Create engineered features
-        df_engineered = self._create_engineered_features(
-            data, target_feature, analysis_features
+        # Create copy of dataframe
+        df_processed = df.copy()
+        
+        # List to keep track of features used in analysis
+        features_for_analysis = []
+        
+        # Add raw features if selected
+        for feature in analysis_features:
+            if feature_options[feature]['use_raw']:
+                features_for_analysis.append(feature)
+                logging.info(f"Using raw feature: {feature}")
+        
+        # Add ratio features if selected
+        df_processed, engineered_features = self._create_engineered_features(
+            df_processed, 
+            target_feature,
+            analysis_features
         )
         
-        # Combine original and engineered features
-        features_for_analysis = analysis_features
+        # Add engineered features to analysis features
+        features_for_analysis.extend(engineered_features)
         
-        # Run Isolation Forest
+        logging.info(f"Total features used in analysis: {features_for_analysis}")
+        
+        # Prepare features for isolation forest
+        X = df_processed[features_for_analysis].values
+        
+        # Run isolation forest analysis
         predictions = self.analyzer.fit_predict(
-            df_engineered,
+            df_processed,
             features_to_use=features_for_analysis
         )
         
-        # Create results DataFrame
-        results = data.copy()
+        # Create results DataFrame with all original and engineered features
+        results = df_processed.copy()
         results['is_anomaly'] = predictions == -1
         results['anomaly_score'] = self.analyzer.anomaly_scores
         
         # Save results if output directory provided
         if output_dir:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = Path(output_dir) / f"anomaly_results_{timestamp}.csv"
-            results.to_csv(output_file, index=False)
-            logger.info(f"Results saved to {output_file}")
+            output_path = Path(output_dir) / "analysis_results.csv"
+            results.to_csv(output_path, index=False)
+            logging.info(f"Saved results with {len(engineered_features)} engineered features to {output_path}")
+            
+            # Save feature information
+            feature_info = {
+                'target_feature': target_feature,
+                'raw_features_used': [f for f in analysis_features if feature_options[f]['use_raw']],
+                'engineered_features': engineered_features,
+                'total_features_used': features_for_analysis
+            }
+            
+            feature_info_path = Path(output_dir) / "feature_info.json"
+            with open(feature_info_path, 'w') as f:
+                json.dump(feature_info, f, indent=4)
+            logging.info(f"Saved feature information to {feature_info_path}")
         
         # Create and return result object
         result = AnalysisResult(
             df=results,
             predictions=predictions,
             target_feature=target_feature,
-            analysis_features=analysis_features
+            analysis_features=features_for_analysis
         )
         
         return result
+    
+    def _create_engineered_features(self, 
+                                  df: pd.DataFrame, 
+                                  target_col: str,
+                                  analysis_cols: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+        """
+        Create engineered features based on ratios with target feature
+        
+        Returns:
+            Tuple[pd.DataFrame, List[str]]: DataFrame with engineered features and list of created feature names
+        """
+        df = df.copy()
+        engineered_features = []
+        
+        # Create ratios between target and each analysis feature
+        for col in analysis_cols:
+            if col != target_col and self.feature_options[col]['use_ratio']:
+                feature_name = f"{target_col}_to_{col}_ratio"
+                # Avoid division by zero by adding small constant
+                df[feature_name] = (df[target_col] / 
+                                  df[col].clip(lower=0.0001))
+                
+                engineered_features.append(feature_name)
+                logging.info(f"Created engineered feature: {feature_name}")
+        
+        return df, engineered_features
     
     def _generate_visualizations(self, 
                                df: pd.DataFrame,
@@ -171,11 +205,21 @@ if __name__ == "__main__":
     # Create analyzer
     analyzer = AdvancedAnomalyAnalyzer(contamination=0.1)
     
+    # Define feature options
+    feature_options = {
+        'IRDelta': {'use_raw': True, 'use_ratio': True},
+        'IRVega': {'use_raw': True, 'use_ratio': True},
+        'NPV': {'use_raw': True, 'use_ratio': False},
+        'Notional': {'use_raw': True, 'use_ratio': False},
+        'DaysToExpiry': {'use_raw': True, 'use_ratio': False}
+    }
+    
     # Run analysis with Theta as target feature
     result = analyzer.analyze(
         data=df,
         target_feature='Theta',
         analysis_features=['IRDelta', 'IRVega', 'NPV', 'Notional', 'DaysToExpiry'],
+        feature_options=feature_options,
         output_dir=output_dir
     )
     
